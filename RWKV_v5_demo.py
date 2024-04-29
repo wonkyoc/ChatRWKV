@@ -7,6 +7,8 @@ np.set_printoptions(precision=4, suppress=True, linewidth=200)
 import types, torch
 import torch.nn as nn
 from torch.nn import functional as F
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 MyModule = torch.jit.ScriptModule
 MyFunction = torch.jit.script_method
@@ -102,13 +104,12 @@ def sample_logits(out, temperature=1.0, top_p=0.8):
     return out
 
 ########################################################################################################
-
-tokenizer = RWKV_TOKENIZER("/fsx/BlinkDL/CODE/_PUBLIC_/ChatRWKV/tokenizer/rwkv_vocab_v20230424.txt")
+tokenizer = RWKV_TOKENIZER("/home/wonkyoc/git/ChatRWKV/tokenizer/rwkv_vocab_v20230424.txt")
 
 # THIS IS NOW UPDATED TO SUPPORT LATEST RWKV-5 WORLD v2 MODELS
 
 args = types.SimpleNamespace()
-args.MODEL_NAME = '/fsx/BlinkDL/HF-MODEL/temp/RWKV-5-World-0B4-v2-OnlyForTest_71%_trained-20231104-ctx4096'
+args.MODEL_NAME = '/home/wonkyoc/git/rwkv-5-world/RWKV-5-World-0.4B-v2-20231113-ctx4096'
 args.n_layer = 24
 args.n_embd = 1024
 args.vocab_size = 65536
@@ -119,6 +120,53 @@ NUM_TRIALS = 3
 LENGTH_PER_TRIAL = 100
 TEMPERATURE = 1.0
 TOP_P = 0.7
+
+LOG_PATH = "/home/wonkyoc/git/ChatRWKV/results"
+
+def plot_weight(worigin, wapprox, k, r):
+    """
+    worigin: the original weight
+    wapprox: the approximated weight
+    k: the name of weight
+    r: rank
+    """
+    fig, axes = plt.subplots(1,2)
+    fig.suptitle(f"{k}")
+
+    sns.heatmap(worigin, ax=axes[0], vmax=1, vmin=-1)
+    axes[0].set_title(f"original weight")
+    sns.heatmap(wapprox, ax=axes[1], vmax=1, vmin=-1)
+    axes[1].set_title(f"rank={r} weight")
+
+    plt.savefig(f"{LOG_PATH}/{k}-{r}.png")
+    plt.close()
+
+def plot_sigma(sigma, k):
+    """
+    sigma: an importance matrix or a sigma matrix from USV^T
+    k: the name of weight
+    """
+
+
+    fig, axes = plt.subplots(1,2)
+    fig.suptitle(f"{k}")
+    axes[0].semilogy(sigma)
+    axes[0].set_title(f"Singular values")
+    axes[1].plot(np.cumsum(sigma)/np.sum(sigma))
+    axes[1].set_title(f"Singular values: cumulative values")
+    plt.savefig(f"{LOG_PATH}/{k}-sigma.png")
+    plt.close()
+
+def build_ranks(sigma):
+    """
+    sigma: the eigenvalues
+    """
+    threshold = 0.99
+    cum_sigma = np.cumsum(sigma)/np.sum(sigma)
+    for i, s in enumerate(cum_sigma):
+        if s >= threshold:
+            return i
+
 
 class RWKV_RNN(MyModule):
     def __init__(self, args):
@@ -135,6 +183,23 @@ class RWKV_RNN(MyModule):
 
         self.n_head = w['blocks.0.att.time_decay'].shape[0]
         self.head_size = w['blocks.0.ln1.weight'].shape[0] // self.n_head
+
+        total = []
+        for k, v in w.items():
+            if len(v.shape) < 2:
+                continue
+            if "weight" and "blocks" in k and (v.shape[0] == v.shape[1]):
+                # SVD https://youtu.be/H7qMMudo3e8?si=-LfBKhF0SXZdALrv
+                U, S, VT = np.linalg.svd(w[k], full_matrices=False)
+                r = build_ranks(S)
+                S = np.diag(S)
+                #plot_sigma(S, k)
+                print(f"{k} rank={r}")
+                total.append(r)
+                w_approx = U[:, :r] @ S[0:r, :r] @ VT[:r, :]
+                #plot_weight(v.numpy(), w_approx, k, r)
+                w[k] = torch.from_numpy(w_approx).to(torch.float32)
+        print(f"avg rank = {sum(total)/len(total)}")
         
         self.w = types.SimpleNamespace() # set self.w from w
         self.w.blocks = {}
