@@ -104,15 +104,24 @@ def sample_logits(out, temperature=1.0, top_p=0.8):
     return out
 
 ########################################################################################################
-tokenizer = RWKV_TOKENIZER("/home/wonkyoc/git/ChatRWKV/tokenizer/rwkv_vocab_v20230424.txt")
+tokenizer = RWKV_TOKENIZER("/p/alpha/ChatRWKV/tokenizer/rwkv_vocab_v20230424.txt")
 
 # THIS IS NOW UPDATED TO SUPPORT LATEST RWKV-5 WORLD v2 MODELS
 
 args = types.SimpleNamespace()
-args.MODEL_NAME = '/home/wonkyoc/git/rwkv-5-world/RWKV-5-World-0.4B-v2-20231113-ctx4096'
-args.n_layer = 24
-args.n_embd = 1024
+args.MODEL_NAME = '/p/alpha/rwkv-5-world/RWKV-5-World-0.4B-F4-x052att-ctx4096'
+args.MODEL_NAME = '/u/bfr4xr/git/RWKV-LM/RWKV-v5/out/L24-D1024-F4-x052att/rwkv-0'
+args.MODEL_NAME = '/p/alpha/rwkv-5-world/rwkv-3b-0'
+#args.MODEL_NAME = '/u/bfr4xr/git/RWKV-LM/RWKV-v5/out/L32-D2560-F4-x052att/rwkv-init'
+#args.MODEL_NAME = '/p/alpha/rwkv-5-world/RWKV-5-World-0.4B-v2-20231113-ctx4096-test-svd-F4'
+#args.MODEL_NAME = '/bigtemp/xl6yq/rwkv-0'
+#RWKV-5-World-0.4B-v2-20231113-ctx4096'
+args.n_layer = 32
+args.n_embd = 2560
+#args.n_layer = 24
+#args.n_embd = 1024
 args.vocab_size = 65536
+args.svdfac = 4
 
 context = "\nElon Musk has"
 # context = "\n我们发现"
@@ -184,23 +193,12 @@ class RWKV_RNN(MyModule):
         self.n_head = w['blocks.0.att.time_decay'].shape[0]
         self.head_size = w['blocks.0.ln1.weight'].shape[0] // self.n_head
 
-        total = []
-        for k, v in w.items():
-            if len(v.shape) < 2:
-                continue
-            if "weight" and "blocks" in k and (v.shape[0] == v.shape[1]):
-                # SVD https://youtu.be/H7qMMudo3e8?si=-LfBKhF0SXZdALrv
-                U, S, VT = np.linalg.svd(w[k], full_matrices=False)
-                r = build_ranks(S)
-                S = np.diag(S)
-                #plot_sigma(S, k)
-                print(f"{k} rank={r}")
-                total.append(r)
-                w_approx = U[:, :r] @ S[0:r, :r] @ VT[:r, :]
-                #plot_weight(v.numpy(), w_approx, k, r)
-                w[k] = torch.from_numpy(w_approx).to(torch.float32)
-        print(f"avg rank = {sum(total)/len(total)}")
-        
+        self.svd_to_full(w)
+
+        #for k, v in w.items():
+        #    if "weight" in k:
+        #        print(k)
+
         self.w = types.SimpleNamespace() # set self.w from w
         self.w.blocks = {}
         for k in w.keys(): # example: "blocks.0.att.time_first" => self.w.blocks[0].att.time_first
@@ -216,6 +214,46 @@ class RWKV_RNN(MyModule):
                     if not hasattr(here, p): setattr(here, p, types.SimpleNamespace())
                     here = getattr(here, p)
             setattr(here, last, w[k])
+
+    def full_to_svd(self, w):
+        #shortkeys = ["receptance", "key", "value", "gate"]
+        for k, v in w.items():
+            if "weight" and "blocks" in k and (v.shape[0] == v.shape[1]):
+                # SVD https://youtu.be/H7qMMudo3e8?si=-LfBKhF0SXZdALrv
+                U, S, VT = np.linalg.svd(w[k], full_matrices=False)
+                r = build_ranks(S)
+                S = np.diag(S)
+                #plot_sigma(S, k)
+                print(f"{k} rank={r}")
+                total.append(r)
+                w_approx = U[:, :r] @ S[0:r, :r] @ VT[:r, :]
+                #plot_weight(v.numpy(), w_approx, k, r)
+                w[k] = torch.from_numpy(w_approx).to(torch.float32)
+        #print(f"avg rank = {sum(total)/len(total)}")
+
+    def svd_to_full(self, w):
+        for k in w.keys():
+            print(k)  #  also print para names on the way...
+            w[k] = w[k].float() # convert to f32 type       
+
+        self.n_head = w['blocks.0.att.time_decay'].shape[0]
+        self.head_size = w['blocks.0.ln1.weight'].shape[0] // self.n_head
+        self.rank = args.n_embd // args.svdfac 
+
+        shortkeys = ["receptance", "key", "value", "gate"]
+        for i in range(args.n_layer):
+            for kk in shortkeys:                
+                n0 = f"blocks.{i}.att.{kk}.weight"
+                n1 = f"blocks.{i}.att.{kk}1.weight"
+                n2 = f"blocks.{i}.att.{kk}2.weight"
+                w1 = w[n1]
+                w2 = w[n2]
+                w0 = w2 @ w1
+                del w[n1]
+                del w[n2]
+                w[n0] = w0
+        
+        return w
 
     def layer_norm(self, x, w):
         return F.layer_norm(x, (self.args.n_embd,), weight=w.weight, bias=w.bias)
